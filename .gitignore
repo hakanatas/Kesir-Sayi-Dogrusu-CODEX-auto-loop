@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+
+# Build/output artifacts
+output/
+
+# Local env
+.env
+.env.*
+
+# JS deps
+node_modules/
+
+# Logs
+*.log
