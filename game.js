@@ -1101,24 +1101,29 @@
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       state.camera.errorText = "Tarayıcı kamera API'si yok.";
       setFeedback(state.camera.errorText, "warning", 2.2);
+      console.warn("[KesirKamera] getUserMedia API bulunamadı");
       return false;
     }
 
-    // Raspberry Pi uyumu: önce facingMode olmadan dene, sonra ön kamera, en son bare true
+    // Raspberry Pi uyumu: alan_cevre ile aynı constraint yapısı
     const videoConstraints = [
+      { width: 1280, height: 720 },
       { width: { ideal: 640 }, height: { ideal: 480 } },
-      { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       true,
     ];
 
     let stream = null;
     let lastError = null;
 
-    for (const constraint of videoConstraints) {
+    for (let i = 0; i < videoConstraints.length; i++) {
+      const constraint = videoConstraints[i];
       try {
+        console.log(`[KesirKamera] Constraint #${i + 1} deneniyor:`, JSON.stringify(constraint));
         stream = await navigator.mediaDevices.getUserMedia({ video: constraint, audio: false });
+        console.log(`[KesirKamera] Constraint #${i + 1} başarılı!`);
         break;
       } catch (err) {
+        console.warn(`[KesirKamera] Constraint #${i + 1} başarısız:`, err.name, err.message);
         lastError = err;
       }
     }
@@ -1127,6 +1132,7 @@
       const reason = lastError ? `${lastError.name}: ${lastError.message}` : "Bilinmeyen hata";
       state.camera.errorText = `Kamera açılamadı — ${reason}`;
       setFeedback(state.camera.errorText, "warning", 4);
+      console.error("[KesirKamera] Tüm constraint'ler başarısız:", reason);
       return false;
     }
 
@@ -1134,13 +1140,21 @@
       state.camera.stream = stream;
       cameraVideo.srcObject = stream;
       // Video hazır olana kadar bekle, sonra play() çağır (Pi uyumu)
+      console.log("[KesirKamera] Video yüklenmesi bekleniyor...");
       await new Promise((resolve, reject) => {
-        cameraVideo.onloadeddata = () => resolve();
+        cameraVideo.onloadeddata = () => {
+          console.log("[KesirKamera] Video loadeddata event alındı");
+          resolve();
+        };
         cameraVideo.onerror = (e) => reject(e);
         // Zaten yüklüyse hemen devam et
-        if (cameraVideo.readyState >= 2) resolve();
+        if (cameraVideo.readyState >= 2) {
+          console.log("[KesirKamera] Video zaten hazır (readyState:", cameraVideo.readyState, ")");
+          resolve();
+        }
       });
       await cameraVideo.play();
+      console.log("[KesirKamera] Video play() başarılı!");
       state.camera.active = true;
       state.camera.baselineReady = false;
       state.camera.pointerX = 0.5;
@@ -1255,15 +1269,19 @@
     }
 
     ml.loading = true;
+    console.log("[KesirKamera] MediaPipe Tasks Vision yükleniyor...");
     ml.loadPromise = (async () => {
       try {
         // Yeni MediaPipe Tasks Vision API — Raspberry Pi + tüm platformlar
+        console.log("[KesirKamera] vision_bundle.js import ediliyor...");
         const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js");
         const { HandLandmarker, FilesetResolver } = vision;
+        console.log("[KesirKamera] vision_bundle.js yüklendi, WASM çözümleniyor...");
 
         const filesetResolver = await FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
         );
+        console.log("[KesirKamera] WASM çözümlendi, HandLandmarker oluşturuluyor...");
 
         // Önce GPU dene, başarısız olursa CPU'ya düş (Raspberry Pi uyumu)
         const delegates = ["GPU", "CPU"];
@@ -1271,6 +1289,7 @@
 
         for (const delegate of delegates) {
           try {
+            console.log(`[KesirKamera] delegate="${delegate}" deneniyor...`);
             handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
               baseOptions: {
                 modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
@@ -1279,10 +1298,11 @@
               runningMode: "VIDEO",
               numHands: 1,
             });
+            console.log(`[KesirKamera] HandLandmarker delegate="${delegate}" ile başarılı!`);
             break;
           } catch (delegateErr) {
+            console.warn(`[KesirKamera] delegate="${delegate}" başarısız:`, delegateErr.message);
             if (delegate === "CPU") throw delegateErr;
-            // GPU başarısız, CPU denenecek
           }
         }
 
@@ -1293,6 +1313,7 @@
         setFeedback("☝️ AI parmak takibi hazır — Sadece işaret parmağınla kontrol et!", "success", 2.2);
         return true;
       } catch (error) {
+        console.error("[KesirKamera] MediaPipe yükleme hatası:", error);
         ml.errorText = error instanceof Error ? error.message : String(error);
         ml.loaded = false;
         ml.hands = null;
