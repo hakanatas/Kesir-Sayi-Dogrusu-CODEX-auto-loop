@@ -1104,10 +1104,10 @@
       return false;
     }
 
-    // Önce ön kamera dene, başarısız olursa herhangi bir kamerayı aç (Raspberry Pi uyumu)
+    // Raspberry Pi uyumu: önce facingMode olmadan dene, sonra ön kamera, en son bare true
     const videoConstraints = [
-      { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       { width: { ideal: 640 }, height: { ideal: 480 } },
+      { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       true,
     ];
 
@@ -1200,35 +1200,42 @@
     updateUI();
   }
 
-  function loadScriptOnce(src) {
-    return new Promise((resolve, reject) => {
-      for (const script of document.scripts) {
-        if (script.src === src) {
-          if (script.dataset.loaded === "1") {
-            resolve();
-            return;
-          }
-          script.addEventListener("load", () => resolve(), { once: true });
-          script.addEventListener("error", () => reject(new Error(`Script yüklenemedi: ${src}`)), { once: true });
-          return;
-        }
-      }
+  // ── MediaPipe Tasks Vision — yeni HandLandmarker API (Raspberry Pi uyumlu) ──
+  function processHandLandmarks(landmarks) {
+    // Sadece işaret parmağı kalkık mı kontrol et
+    const isFingerUp = (tipIdx, pipIdx) => landmarks[tipIdx].y < landmarks[pipIdx].y;
+    const isFingerDown = (tipIdx, pipIdx) => landmarks[tipIdx].y >= landmarks[pipIdx].y;
 
-      const script = document.createElement("script");
-      script.src = src;
-      script.async = true;
-      script.crossOrigin = "anonymous";
-      script.addEventListener(
-        "load",
-        () => {
-          script.dataset.loaded = "1";
-          resolve();
-        },
-        { once: true }
-      );
-      script.addEventListener("error", () => reject(new Error(`Script yüklenemedi: ${src}`)), { once: true });
-      document.head.appendChild(script);
-    });
+    const indexUp = isFingerUp(8, 6);       // İşaret parmağı kalkık
+    const middleDown = isFingerDown(12, 10); // Orta parmak kapalı
+    const ringDown = isFingerDown(16, 14);   // Yüzük parmağı kapalı
+    const pinkyDown = isFingerDown(20, 18);  // Serçe parmak kapalı
+
+    const onlyIndexPointing = indexUp && middleDown && ringDown && pinkyDown;
+    state.camera.indexFingerVisible = onlyIndexPointing;
+
+    const ml = state.camera.ml;
+
+    if (!onlyIndexPointing) {
+      const unseenFor = performance.now() - ml.lastSeen;
+      if (unseenFor > 120) {
+        state.camera.trackingConfidence = Math.max(0, state.camera.trackingConfidence - 0.1);
+        state.camera.lastMotion = Math.max(0, state.camera.lastMotion * 0.82);
+      }
+      return;
+    }
+
+    const tip = landmarks[8];
+    const pip = landmarks[6];
+    const tipX = clamp(tip.x, 0, 1);
+    const tipY = clamp(tip.y, 0, 1);
+    const depthWeight = clamp(0.3 + Math.abs((pip ? pip.y : tipY) - tipY) * 2.4, 0.3, 1);
+
+    state.camera.pointerX = lerp(state.camera.pointerX, tipX, 0.46);
+    state.camera.pointerY = lerp(state.camera.pointerY, tipY, 0.42);
+    state.camera.trackingConfidence = clamp(0.74 + depthWeight * 0.22, 0, 1);
+    state.camera.lastMotion = 30000 * state.camera.trackingConfidence;
+    ml.lastSeen = performance.now();
   }
 
   async function ensureMlTracker() {
@@ -1243,71 +1250,24 @@
     ml.loading = true;
     ml.loadPromise = (async () => {
       try {
-        await loadScriptOnce("https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js");
-        if (!window.Hands) {
-          throw new Error("MediaPipe Hands API bulunamadı.");
-        }
+        // Yeni MediaPipe Tasks Vision API — Raspberry Pi + tüm platformlar
+        const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js");
+        const { HandLandmarker, FilesetResolver } = vision;
 
-        const hands = new window.Hands({
-          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-        });
-        hands.setOptions({
-          maxNumHands: 1,
-          modelComplexity: 1,
-          minDetectionConfidence: 0.62,
-          minTrackingConfidence: 0.55,
-        });
-        hands.onResults((results) => {
-          const handsFound = results && Array.isArray(results.multiHandLandmarks) ? results.multiHandLandmarks : [];
-          if (!handsFound.length) {
-            state.camera.indexFingerVisible = false;
-            const unseenFor = performance.now() - ml.lastSeen;
-            if (unseenFor > 180) {
-              state.camera.trackingConfidence = Math.max(0, state.camera.trackingConfidence - 0.08);
-              state.camera.lastMotion = Math.max(0, state.camera.lastMotion * 0.86);
-            }
-            return;
-          }
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+        );
 
-          const landmarks = handsFound[0];
-
-          // Sadece işaret parmağı kalkık mı kontrol et
-          // Parmak kalkık = tip landmark'ı PIP'den daha yukarıda (daha küçük y)
-          const isFingerUp = (tipIdx, pipIdx) => landmarks[tipIdx].y < landmarks[pipIdx].y;
-          const isFingerDown = (tipIdx, pipIdx) => landmarks[tipIdx].y >= landmarks[pipIdx].y;
-
-          const indexUp = isFingerUp(8, 6);       // İşaret parmağı kalkık
-          const middleDown = isFingerDown(12, 10); // Orta parmak kapalı
-          const ringDown = isFingerDown(16, 14);   // Yüzük parmağı kapalı
-          const pinkyDown = isFingerDown(20, 18);  // Serçe parmak kapalı
-
-          const onlyIndexPointing = indexUp && middleDown && ringDown && pinkyDown;
-          state.camera.indexFingerVisible = onlyIndexPointing;
-
-          if (!onlyIndexPointing) {
-            // İşaret parmağı tek başına kalkık değilse takibi durdur
-            const unseenFor = performance.now() - ml.lastSeen;
-            if (unseenFor > 120) {
-              state.camera.trackingConfidence = Math.max(0, state.camera.trackingConfidence - 0.1);
-              state.camera.lastMotion = Math.max(0, state.camera.lastMotion * 0.82);
-            }
-            return;
-          }
-
-          const tip = landmarks[8];
-          const pip = landmarks[6];
-          const tipX = clamp(tip.x, 0, 1);
-          const tipY = clamp(tip.y, 0, 1);
-          const depthWeight = clamp(0.3 + Math.abs((pip ? pip.y : tipY) - tipY) * 2.4, 0.3, 1);
-
-          state.camera.pointerX = lerp(state.camera.pointerX, tipX, 0.46);
-          state.camera.pointerY = lerp(state.camera.pointerY, tipY, 0.42);
-          state.camera.trackingConfidence = clamp(0.74 + depthWeight * 0.22, 0, 1);
-          state.camera.lastMotion = 30000 * state.camera.trackingConfidence;
-          ml.lastSeen = performance.now();
+        const handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numHands: 1,
         });
 
-        ml.hands = hands;
+        ml.hands = handLandmarker;
         ml.loaded = true;
         ml.errorText = "";
         state.camera.tracker = "ai";
@@ -1495,21 +1455,30 @@
 
     const ml = state.camera.ml;
     if (ml.loaded && ml.hands) {
-      if (!ml.busy && performance.now() - ml.lastInference >= 34) {
-        ml.busy = true;
+      // Yeni Tasks Vision API — senkron detectForVideo() kullan
+      if (performance.now() - ml.lastInference >= 34) {
         ml.lastInference = performance.now();
-        ml.hands
-          .send({ image: cameraVideo })
-          .catch(() => {
-            state.camera.tracker = "basic";
-            ml.hands = null;
-            ml.loaded = false;
-            ml.errorText = "AI takip geçici olarak devre dışı. Basic takip kullanılıyor.";
-          })
-          .finally(() => {
-            ml.busy = false;
-          });
+        try {
+          const results = ml.hands.detectForVideo(cameraVideo, performance.now());
+          if (results && results.landmarks && results.landmarks.length > 0) {
+            processHandLandmarks(results.landmarks[0]);
+          } else {
+            // El bulunamadı
+            state.camera.indexFingerVisible = false;
+            const unseenFor = performance.now() - ml.lastSeen;
+            if (unseenFor > 180) {
+              state.camera.trackingConfidence = Math.max(0, state.camera.trackingConfidence - 0.08);
+              state.camera.lastMotion = Math.max(0, state.camera.lastMotion * 0.86);
+            }
+          }
+        } catch {
+          state.camera.tracker = "basic";
+          ml.hands = null;
+          ml.loaded = false;
+          ml.errorText = "AI takip geçici olarak devre dışı. Basic takip kullanılıyor.";
+        }
       }
+
       const aiSeenRecently = performance.now() - ml.lastSeen <= 260;
       if (aiSeenRecently && state.camera.trackingConfidence > 0.2) {
         state.camera.tracker = "ai";
