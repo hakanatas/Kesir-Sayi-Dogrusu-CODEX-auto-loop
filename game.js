@@ -1133,6 +1133,13 @@
     try {
       state.camera.stream = stream;
       cameraVideo.srcObject = stream;
+      // Video hazır olana kadar bekle, sonra play() çağır (Pi uyumu)
+      await new Promise((resolve, reject) => {
+        cameraVideo.onloadeddata = () => resolve();
+        cameraVideo.onerror = (e) => reject(e);
+        // Zaten yüklüyse hemen devam et
+        if (cameraVideo.readyState >= 2) resolve();
+      });
       await cameraVideo.play();
       state.camera.active = true;
       state.camera.baselineReady = false;
